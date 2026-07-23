@@ -24,11 +24,19 @@ import {
 } from "lucide-react";
 import type {
   CircleMarker,
+  LayerGroup,
   Map as LeafletMap,
   Marker,
-  Polyline,
 } from "leaflet";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import {
   AREA_META,
   AREA_ORDER,
@@ -36,9 +44,13 @@ import {
   FALL_2026_PLAN,
   OFFICIAL_LINKS,
   PLACES,
+  SHUTTLE_ROUTE_NAME,
+  SHUTTLE_ROUTE_SHAPE,
+  SHUTTLE_STOPS,
   type Place,
   type PlaceArea,
   type PlaceCategory,
+  type ShuttleStop,
 } from "./data";
 import {
   fetchRoute,
@@ -48,6 +60,16 @@ import {
 
 type OriginMode = "edens" | "current";
 type TravelMode = "walk" | "bike" | "drive" | "shuttle";
+type SheetSnap = "peek" | "medium" | "full";
+
+type ShuttlePlan = {
+  routeName: string;
+  board: ShuttleStop;
+  alight: ShuttleStop;
+  stops: ShuttleStop[];
+  originWalkKm: number;
+  destinationWalkKm: number;
+};
 
 const EDENS = PLACES.find((place) => place.id === "edens-1a")!;
 
@@ -55,9 +77,9 @@ const TRAVEL_MODE_META: Record<
   TravelMode,
   { label: string; engine?: EngineRouteMode }
 > = {
-  walk: { label: "步行", engine: "pedestrian" },
-  bike: { label: "骑行", engine: "bicycle" },
-  drive: { label: "驾车", engine: "auto" },
+  walk: { label: "??", engine: "pedestrian" },
+  bike: { label: "??", engine: "bicycle" },
+  drive: { label: "??", engine: "auto" },
   shuttle: { label: "Duke Shuttle" },
 };
 
@@ -65,20 +87,168 @@ function placeArea(place: Place): PlaceArea {
   return place.area ?? "west";
 }
 
-function travelModesFor(place: Place): TravelMode[] {
-  const area = placeArea(place);
-  if (area === "travel" || area === "triangle") return ["drive"];
-  if (area === "durham" || area === "essentials")
-    return ["bike", "drive"];
-  const modes: TravelMode[] = ["walk", "bike", "drive"];
-  if (place.shuttle) modes.push("shuttle");
+function distanceKm(
+  pointA: [number, number],
+  pointB: [number, number],
+) {
+  const toRadians = (degrees: number) => (degrees * Math.PI) / 180;
+  const latDelta = toRadians(pointB[0] - pointA[0]);
+  const lonDelta = toRadians(pointB[1] - pointA[1]);
+  const latA = toRadians(pointA[0]);
+  const latB = toRadians(pointB[0]);
+  const haversine =
+    Math.sin(latDelta / 2) ** 2 +
+    Math.cos(latA) * Math.cos(latB) * Math.sin(lonDelta / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
+}
+
+function nearestShuttleStop(point: [number, number]) {
+  return SHUTTLE_STOPS.reduce(
+    (nearest, stop) => {
+      const distance = distanceKm(point, stop.coordinates);
+      return distance < nearest.distance ? { stop, distance } : nearest;
+    },
+    {
+      stop: SHUTTLE_STOPS[0],
+      distance: Number.POSITIVE_INFINITY,
+    },
+  );
+}
+
+function shuttlePlanFor(
+  origin: [number, number],
+  destination: [number, number],
+): ShuttlePlan | null {
+  const originStop = nearestShuttleStop(origin);
+  const destinationStop = nearestShuttleStop(destination);
+  const boardIndex = SHUTTLE_STOPS.findIndex(
+    (stop) => stop.id === originStop.stop.id,
+  );
+  const alightIndex = SHUTTLE_STOPS.findIndex(
+    (stop) => stop.id === destinationStop.stop.id,
+  );
+
+  if (
+    boardIndex === alightIndex ||
+    originStop.distance > 1.2 ||
+    destinationStop.distance > 1.5
+  ) {
+    return null;
+  }
+
+  const stops: ShuttleStop[] = [];
+  let index = boardIndex;
+  while (true) {
+    stops.push(SHUTTLE_STOPS[index]);
+    if (index === alightIndex) break;
+    index = (index + 1) % SHUTTLE_STOPS.length;
+  }
+
+  return {
+    routeName: SHUTTLE_ROUTE_NAME,
+    board: originStop.stop,
+    alight: destinationStop.stop,
+    stops,
+    originWalkKm: originStop.distance,
+    destinationWalkKm: destinationStop.distance,
+  };
+}
+
+function shuttleShapeFor(plan: ShuttlePlan) {
+  const nearestIndex = (point: [number, number]) =>
+    SHUTTLE_ROUTE_SHAPE.reduce(
+      (nearest, shapePoint, index) => {
+        const distance = distanceKm(point, shapePoint);
+        return distance < nearest.distance ? { index, distance } : nearest;
+      },
+      { index: 0, distance: Number.POSITIVE_INFINITY },
+    ).index;
+  const boardIndex = nearestIndex(plan.board.coordinates);
+  const alightIndex = nearestIndex(plan.alight.coordinates);
+  const shape =
+    boardIndex <= alightIndex
+      ? SHUTTLE_ROUTE_SHAPE.slice(boardIndex, alightIndex + 1)
+      : [
+          ...SHUTTLE_ROUTE_SHAPE.slice(boardIndex),
+          ...SHUTTLE_ROUTE_SHAPE.slice(0, alightIndex + 1),
+        ];
+  return [plan.board.coordinates, ...shape, plan.alight.coordinates];
+}
+
+function travelModesFor(
+  place: Place,
+  origin: [number, number],
+): TravelMode[] {
+  const tripDistance = distanceKm(origin, place.coordinates);
+  const modes: TravelMode[] =
+    tripDistance <= 4.5
+      ? ["walk", "bike", "drive"]
+      : tripDistance <= 18
+        ? ["bike", "drive"]
+        : ["drive"];
+  if (shuttlePlanFor(origin, place.coordinates)) modes.push("shuttle");
   return modes;
 }
 
+function useHorizontalDrag<T extends HTMLElement>() {
+  const ref = useRef<T | null>(null);
+  const gesture = useRef({
+    pointerId: -1,
+    startX: 0,
+    startScrollLeft: 0,
+    moved: false,
+  });
+
+  return {
+    ref,
+    onPointerDown(event: ReactPointerEvent<HTMLElement>) {
+      if (event.pointerType === "mouse" && event.button !== 0) return;
+      gesture.current = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startScrollLeft: event.currentTarget.scrollLeft,
+        moved: false,
+      };
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId);
+      } catch {
+        // Some embedded browsers do not expose pointer capture.
+      }
+    },
+    onPointerMove(event: ReactPointerEvent<HTMLElement>) {
+      if (gesture.current.pointerId !== event.pointerId) return;
+      const delta = event.clientX - gesture.current.startX;
+      if (Math.abs(delta) > 5) gesture.current.moved = true;
+      if (gesture.current.moved) {
+        event.currentTarget.scrollLeft =
+          gesture.current.startScrollLeft - delta;
+        event.preventDefault();
+      }
+    },
+    onPointerUp(event: ReactPointerEvent<HTMLElement>) {
+      if (gesture.current.pointerId !== event.pointerId) return;
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+      gesture.current.pointerId = -1;
+    },
+    onPointerCancel(event: ReactPointerEvent<HTMLElement>) {
+      if (gesture.current.pointerId !== event.pointerId) return;
+      gesture.current.pointerId = -1;
+    },
+    onClickCapture(event: ReactMouseEvent<HTMLElement>) {
+      if (!gesture.current.moved) return;
+      event.preventDefault();
+      event.stopPropagation();
+      gesture.current.moved = false;
+    },
+  };
+}
+
 function confidenceLabel(place: Place) {
-  if (place.confidence === "verified") return "Duke 数据核验";
-  if (place.confidence === "cross-checked") return "已交叉核验";
-  return "课程信息待确认";
+  if (place.confidence === "verified") return "Duke ????";
+  if (place.confidence === "cross-checked") return "?????";
+  return "???????";
 }
 
 function mapsLink(
@@ -110,19 +280,45 @@ export default function DukeMapClient() {
   const [route, setRoute] = useState<RouteResult | null>(null);
   const [routeLoading, setRouteLoading] = useState(false);
   const [routeMessage, setRouteMessage] = useState("");
+  const [shuttlePlan, setShuttlePlan] = useState<ShuttlePlan | null>(null);
   const [travelMode, setTravelMode] = useState<TravelMode>("walk");
   const [sheetOpen, setSheetOpen] = useState(true);
+  const [sheetHeight, setSheetHeight] = useState<number | null>(null);
+  const [sheetDragging, setSheetDragging] = useState(false);
   const [showSources, setShowSources] = useState(false);
 
   const mapNodeRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<LeafletMap | null>(null);
+  const detailCardRef = useRef<HTMLElement | null>(null);
   const markerRefs = useRef<Record<string, Marker>>({});
-  const routeLayerRef = useRef<Polyline | null>(null);
+  const routeLayerRef = useRef<LayerGroup | null>(null);
+  const routeEndpointRefs = useRef<{
+    origin: Marker | null;
+    destination: Marker | null;
+  }>({ origin: null, destination: null });
   const userMarkerRef = useRef<CircleMarker | null>(null);
+  const sheetRef = useRef<HTMLElement | null>(null);
+  const sheetGestureRef = useRef({
+    pointerId: -1,
+    startY: 0,
+    startHeight: 0,
+    moved: false,
+  });
+  const mobileAreaDrag = useHorizontalDrag();
+  const areaDrag = useHorizontalDrag();
+  const categoryDrag = useHorizontalDrag();
 
   const selectedPlace =
     PLACES.find((place) => place.id === selectedId) ?? EDENS;
-  const availableTravelModes = travelModesFor(selectedPlace);
+  const routeOrigin =
+    originMode === "current" && userLocation
+      ? userLocation
+      : EDENS.coordinates;
+  const availableTravelModes = travelModesFor(selectedPlace, routeOrigin);
+  const shuttlePreview = shuttlePlanFor(
+    routeOrigin,
+    selectedPlace.coordinates,
+  );
 
   const availableCategories = useMemo(() => {
     const categories = new Set(
@@ -177,7 +373,7 @@ export default function DukeMapClient() {
       L.control.zoom({ position: "topright" }).addTo(map);
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
         maxZoom: 20,
-        attribution: "© OpenStreetMap contributors",
+        attribution: "? OpenStreetMap contributors",
       }).addTo(map);
 
       for (const place of PLACES) {
@@ -196,7 +392,7 @@ export default function DukeMapClient() {
         if (placeArea(place) === "west") marker.addTo(map);
 
         marker.bindTooltip(
-          `<span class="marker-preview-emoji">${place.previewEmoji ?? place.markerLabel}</span><span class="marker-preview-copy"><b>${place.shortName}</b><small>${AREA_META[placeArea(place)].shortLabel} · ${place.categoryLabel}</small></span>`,
+          `<span class="marker-preview-emoji">${place.previewEmoji ?? place.markerLabel}</span><span class="marker-preview-copy"><b>${place.shortName}</b><small>${AREA_META[placeArea(place)].shortLabel} ? ${place.categoryLabel}</small></span>`,
           {
             direction: "top",
             offset: [0, -43],
@@ -206,10 +402,21 @@ export default function DukeMapClient() {
         );
         marker.on("click", () => {
           setSelectedId(place.id);
-          setActiveArea(placeArea(place));
-          const modes = travelModesFor(place);
+          const modes = travelModesFor(place, EDENS.coordinates);
           setTravelMode(modes.includes("walk") ? "walk" : modes[0]);
           setSheetOpen(true);
+          setSheetHeight(null);
+          setRoute(null);
+          setShuttlePlan(null);
+          setRouteMessage("");
+          window.setTimeout(
+            () =>
+              detailCardRef.current?.scrollIntoView({
+                behavior: "smooth",
+                block: "start",
+              }),
+            80,
+          );
         });
         markerRefs.current[place.id] = marker;
       }
@@ -251,21 +458,17 @@ export default function DukeMapClient() {
     const map = mapRef.current;
     const marker = markerRefs.current[selectedPlace.id];
     if (!map || !marker) return;
-    if (!map.hasLayer(marker)) {
-      setActiveArea(placeArea(selectedPlace));
-      setActiveCategory("all");
-      marker.addTo(map);
-    }
+    if (!map.hasLayer(marker)) marker.addTo(map);
     map.flyTo(selectedPlace.coordinates, 17, { duration: 0.65 });
   }, [selectedPlace]);
 
   async function useCurrentLocation() {
     if (!navigator.geolocation) {
-      setLocationMessage("这台设备不支持定位。");
+      setLocationMessage("??????????");
       return;
     }
 
-    setLocationMessage("正在获取当前位置…");
+    setLocationMessage("?????????");
     navigator.geolocation.getCurrentPosition(
       async (position) => {
         const point: [number, number] = [
@@ -274,7 +477,11 @@ export default function DukeMapClient() {
         ];
         setUserLocation(point);
         setOriginMode("current");
-        setLocationMessage("已使用你当前的位置。");
+        const modes = travelModesFor(selectedPlace, point);
+        if (!modes.includes(travelMode)) {
+          setTravelMode(modes.includes("walk") ? "walk" : modes[0]);
+        }
+        setLocationMessage("??????????");
 
         const map = mapRef.current;
         if (map) {
@@ -289,7 +496,7 @@ export default function DukeMapClient() {
               fillColor: "#1677ff",
               fillOpacity: 1,
             })
-              .bindTooltip("你在这里")
+              .bindTooltip("????")
               .addTo(map);
           }
           map.flyTo(point, 17, { duration: 0.6 });
@@ -297,52 +504,172 @@ export default function DukeMapClient() {
       },
       () => {
         setOriginMode("edens");
-        setLocationMessage("定位未开启，已继续使用 Edens 1A。");
+        setLocationMessage("??????????? Edens 1A?");
       },
       { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 },
     );
   }
 
+  function clearRouteLayers() {
+    routeLayerRef.current?.remove();
+    routeLayerRef.current = null;
+    routeEndpointRefs.current.origin?.remove();
+    routeEndpointRefs.current.destination?.remove();
+    routeEndpointRefs.current = { origin: null, destination: null };
+  }
+
+  async function addRouteEndpoints(
+    origin: [number, number],
+    destination: [number, number],
+  ) {
+    const map = mapRef.current;
+    if (!map) return;
+    const L = await import("leaflet");
+
+    routeEndpointRefs.current.origin?.remove();
+    routeEndpointRefs.current.destination?.remove();
+    routeEndpointRefs.current.origin = L.marker(origin, {
+      title: "????",
+      icon: L.divIcon({
+        className: "route-endpoint-shell",
+        html: '<span class="route-endpoint route-origin-pin"><b>?</b></span>',
+        iconSize: [36, 42],
+        iconAnchor: [18, 38],
+      }),
+    })
+      .bindTooltip("????", { direction: "top", offset: [0, -30] })
+      .addTo(map);
+    routeEndpointRefs.current.destination = L.marker(destination, {
+      title: "????",
+      icon: L.divIcon({
+        className: "route-endpoint-shell",
+        html: '<span class="route-endpoint route-destination-pin"><b>?</b></span>',
+        iconSize: [36, 42],
+        iconAnchor: [18, 38],
+      }),
+    })
+      .bindTooltip("????", { direction: "top", offset: [0, -30] })
+      .addTo(map);
+  }
+
+  async function fetchWalkingLeg(
+    from: [number, number],
+    to: [number, number],
+  ) {
+    if (distanceKm(from, to) < 0.025) {
+      return {
+        distanceKm: distanceKm(from, to),
+        points: [from, to] as [number, number][],
+      };
+    }
+    try {
+      const result = await fetchRoute(from, to, "pedestrian");
+      return { distanceKm: result.distanceKm, points: result.points };
+    } catch {
+      return {
+        distanceKm: distanceKm(from, to),
+        points: [from, to] as [number, number][],
+      };
+    }
+  }
+
   async function buildRoute() {
-    const origin =
-      originMode === "current" && userLocation
-        ? userLocation
-        : EDENS.coordinates;
+    const origin = routeOrigin;
     const destination = selectedPlace.coordinates;
 
     if (selectedPlace.id === "edens-1a" && originMode === "edens") {
       setRoute(null);
-      setRouteMessage("Edens 1A 已经是路线起点。");
+      setShuttlePlan(null);
+      setRouteMessage("Edens 1A ????????");
       return;
     }
 
     setRouteLoading(true);
     setRouteMessage("");
+    clearRouteLayers();
 
     try {
       if (travelMode === "shuttle") {
+        const draftPlan = shuttlePlanFor(origin, destination);
+        if (!draftPlan) {
+          setShuttlePlan(null);
+          setRouteMessage("???????????? Duke Shuttle ???");
+          return;
+        }
+
+        const [originWalk, destinationWalk] = await Promise.all([
+          fetchWalkingLeg(origin, draftPlan.board.coordinates),
+          fetchWalkingLeg(draftPlan.alight.coordinates, destination),
+        ]);
+        const completedPlan = {
+          ...draftPlan,
+          originWalkKm: originWalk.distanceKm,
+          destinationWalkKm: destinationWalk.distanceKm,
+        };
+        setShuttlePlan(completedPlan);
         setRoute(null);
+
+        const L = await import("leaflet");
+        const map = mapRef.current;
+        if (map) {
+          const shuttleShape = shuttleShapeFor(draftPlan);
+          const layers = [
+            L.polyline(originWalk.points, {
+              color: "#d47a16",
+              weight: 5,
+              opacity: 0.9,
+              dashArray: "8 8",
+            }),
+            L.polyline(shuttleShape, {
+              color: "#007a5e",
+              weight: 7,
+              opacity: 0.94,
+              lineJoin: "round",
+            }),
+            L.polyline(destinationWalk.points, {
+              color: "#d47a16",
+              weight: 5,
+              opacity: 0.9,
+              dashArray: "8 8",
+            }),
+          ];
+          routeLayerRef.current = L.layerGroup(layers).addTo(map);
+          await addRouteEndpoints(origin, destination);
+          const allPoints = [
+            ...originWalk.points,
+            ...shuttleShape,
+            ...destinationWalk.points,
+          ];
+          map.fitBounds(allPoints, {
+            paddingTopLeft: [60, 110],
+            paddingBottomRight: [60, 230],
+            maxZoom: 17,
+          });
+        }
         return;
       }
 
       const engineMode = TRAVEL_MODE_META[travelMode].engine;
-      if (!engineMode) throw new Error("请选择可用的路线方式。");
+      if (!engineMode) throw new Error("???????????");
       const result = await fetchRoute(origin, destination, engineMode);
 
       setRoute(result);
+      setShuttlePlan(null);
       const L = await import("leaflet");
       const map = mapRef.current;
       if (map) {
-        if (routeLayerRef.current) routeLayerRef.current.remove();
-        routeLayerRef.current = L.polyline(result.points, {
-          color: "#012169",
-          weight: 6,
-          opacity: 0.96,
-          lineJoin: "round",
-        }).addTo(map);
+        routeLayerRef.current = L.layerGroup([
+          L.polyline(result.points, {
+            color: "#012169",
+            weight: 6,
+            opacity: 0.96,
+            lineJoin: "round",
+          }),
+        ]).addTo(map);
+        await addRouteEndpoints(origin, destination);
         map.fitBounds([origin, destination], {
           paddingTopLeft: [60, 110],
-          paddingBottomRight: [60, 210],
+          paddingBottomRight: [60, 230],
           maxZoom: 18,
         });
       }
@@ -351,7 +678,7 @@ export default function DukeMapClient() {
       setRouteMessage(
         error instanceof Error
           ? error.message
-          : "步行路线暂时无法加载，请使用外部地图。",
+          : "???????????????????",
       );
     } finally {
       setRouteLoading(false);
@@ -360,24 +687,113 @@ export default function DukeMapClient() {
 
   function clearRoute() {
     setRoute(null);
+    setShuttlePlan(null);
     setRouteMessage("");
-    routeLayerRef.current?.remove();
-    routeLayerRef.current = null;
+    clearRouteLayers();
   }
 
   function choosePlace(place: Place) {
     setSelectedId(place.id);
-    setActiveArea(placeArea(place));
-    setActiveCategory("all");
-    const modes = travelModesFor(place);
+    const modes = travelModesFor(place, routeOrigin);
     setTravelMode(modes.includes("walk") ? "walk" : modes[0]);
     setSheetOpen(true);
+    setSheetHeight(null);
     clearRoute();
+    window.setTimeout(
+      () =>
+        detailCardRef.current?.scrollIntoView({
+          behavior: "smooth",
+          block: "start",
+        }),
+      80,
+    );
+  }
+
+  function sheetSnapHeight(snap: SheetSnap) {
+    const viewportHeight = window.innerHeight;
+    if (snap === "peek") return 128;
+    if (snap === "full") return Math.min(viewportHeight * 0.91, 860);
+    return Math.min(viewportHeight * 0.66, 700);
+  }
+
+  function handleSheetPointerDown(
+    event: ReactPointerEvent<HTMLButtonElement>,
+  ) {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    const panel = sheetRef.current;
+    if (!panel || window.innerWidth > 760) return;
+    sheetGestureRef.current = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      startHeight: panel.getBoundingClientRect().height,
+      moved: false,
+    };
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Dragging still works while the pointer remains over the handle.
+    }
+  }
+
+  function handleSheetPointerMove(
+    event: ReactPointerEvent<HTMLButtonElement>,
+  ) {
+    if (sheetGestureRef.current.pointerId !== event.pointerId) return;
+    const delta = sheetGestureRef.current.startY - event.clientY;
+    if (Math.abs(delta) > 4) sheetGestureRef.current.moved = true;
+    if (!sheetGestureRef.current.moved) return;
+    setSheetDragging(true);
+    const nextHeight = Math.max(
+      112,
+      Math.min(
+        window.innerHeight * 0.93,
+        sheetGestureRef.current.startHeight + delta,
+      ),
+    );
+    setSheetHeight(nextHeight);
+    setSheetOpen(nextHeight > 150);
+    event.preventDefault();
+  }
+
+  function handleSheetPointerUp(event: ReactPointerEvent<HTMLButtonElement>) {
+    if (sheetGestureRef.current.pointerId !== event.pointerId) return;
+    const currentHeight =
+      sheetRef.current?.getBoundingClientRect().height ?? 128;
+    const candidates: Array<{ snap: SheetSnap; height: number }> = [
+      { snap: "peek", height: sheetSnapHeight("peek") },
+      { snap: "medium", height: sheetSnapHeight("medium") },
+      { snap: "full", height: sheetSnapHeight("full") },
+    ];
+    const nearest = candidates.reduce((best, candidate) =>
+      Math.abs(candidate.height - currentHeight) <
+      Math.abs(best.height - currentHeight)
+        ? candidate
+        : best,
+    );
+    setSheetHeight(nearest.height);
+    setSheetOpen(nearest.snap !== "peek");
+    setSheetDragging(false);
+    sheetGestureRef.current.pointerId = -1;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }
+
+  function toggleSheet() {
+    if (sheetGestureRef.current.moved) {
+      sheetGestureRef.current.moved = false;
+      return;
+    }
+    const nextOpen = !sheetOpen;
+    setSheetOpen(nextOpen);
+    setSheetHeight(
+      nextOpen ? sheetSnapHeight("medium") : sheetSnapHeight("peek"),
+    );
   }
 
   return (
     <main className="map-app">
-      <section className="map-stage" aria-label="Duke 与 Triangle 互动地图">
+      <section className="map-stage" aria-label="Duke ? Triangle ????">
         <div ref={mapNodeRef} className="leaflet-map" />
         <div className="map-wash" aria-hidden="true" />
 
@@ -385,19 +801,23 @@ export default function DukeMapClient() {
           <div className="mobile-mark">KD</div>
           <div>
             <strong>Klein&apos;s Duke Map</strong>
-            <span>Duke + Triangle · V3</span>
+            <span>Duke + Triangle ? V3.1</span>
           </div>
           <button
             type="button"
             className="round-icon-button"
             onClick={useCurrentLocation}
-            aria-label="使用当前位置"
+            aria-label="??????"
           >
             <LocateFixed size={18} />
           </button>
         </header>
 
-        <nav className="mobile-category-strip" aria-label="区域筛选">
+        <nav
+          className="mobile-category-strip draggable-tabs"
+          aria-label="????"
+          {...mobileAreaDrag}
+        >
           <button
             type="button"
             className={activeArea === "all" ? "active" : ""}
@@ -406,7 +826,7 @@ export default function DukeMapClient() {
               setActiveCategory("all");
             }}
           >
-            全部
+            ??
           </button>
           {AREA_ORDER.map((area) => (
             <button
@@ -425,16 +845,30 @@ export default function DukeMapClient() {
 
         <div className="map-accuracy-pill">
           <BadgeCheck size={15} />
-          {PLACES.length} 个固定核验点 · 不再实时猜坐标
+          {PLACES.length} ?????? ? ???????
         </div>
       </section>
 
-      <aside className={`control-panel ${sheetOpen ? "sheet-open" : ""}`}>
+      <aside
+        ref={sheetRef}
+        className={`control-panel ${sheetOpen ? "sheet-open" : ""} ${sheetDragging ? "sheet-dragging" : ""}`}
+        style={
+          {
+            "--sheet-height":
+              sheetHeight === null ? undefined : `${sheetHeight}px`,
+          } as CSSProperties
+        }
+      >
         <button
           type="button"
           className="sheet-handle"
-          aria-label={sheetOpen ? "收起详情" : "展开详情"}
-          onClick={() => setSheetOpen((open) => !open)}
+          aria-label={sheetOpen ? "????" : "????"}
+          aria-expanded={sheetOpen}
+          onPointerDown={handleSheetPointerDown}
+          onPointerMove={handleSheetPointerMove}
+          onPointerUp={handleSheetPointerUp}
+          onPointerCancel={handleSheetPointerUp}
+          onClick={toggleSheet}
         >
           <span />
           {sheetOpen ? <ChevronDown size={17} /> : <ChevronUp size={17} />}
@@ -445,13 +879,13 @@ export default function DukeMapClient() {
             <div className="brand-mark">KD</div>
             <div>
               <h1>Klein&apos;s Duke Map</h1>
-              <p>Duke + Triangle · Fall 2026 · V3</p>
+              <p>Duke + Triangle ? Fall 2026 ? V3.1</p>
             </div>
             <button
               type="button"
               className="round-icon-button desktop-locate"
               onClick={useCurrentLocation}
-              aria-label="使用当前位置"
+              aria-label="??????"
             >
               <LocateFixed size={18} />
             </button>
@@ -460,8 +894,8 @@ export default function DukeMapClient() {
           <div className="trust-banner">
             <BadgeCheck size={19} />
             <div>
-              <strong>准确性优先</strong>
-              <span>分区地点 + 多交通路线 + 官方来源日期</span>
+              <strong>?????</strong>
+              <span>???? + ????? + ??????</span>
             </div>
           </div>
 
@@ -477,21 +911,25 @@ export default function DukeMapClient() {
                   setActiveCategory("all");
                 }
               }}
-              placeholder="搜索地点、餐厅、超市或景点"
-              aria-label="搜索地点、餐厅、超市或景点"
+              placeholder="?????????????"
+              aria-label="?????????????"
             />
             {query && (
               <button
                 type="button"
                 onClick={() => setQuery("")}
-                aria-label="清除搜索"
+                aria-label="????"
               >
                 <X size={16} />
               </button>
             )}
           </label>
 
-          <div className="area-tabs" aria-label="地图区域">
+          <div
+            className="area-tabs draggable-tabs"
+            aria-label="????"
+            {...areaDrag}
+          >
             <button
               type="button"
               className={activeArea === "all" ? "active" : ""}
@@ -500,7 +938,7 @@ export default function DukeMapClient() {
                 setActiveCategory("all");
               }}
             >
-              全部区域
+              ????
             </button>
             {AREA_ORDER.map((area) => (
               <button
@@ -517,13 +955,17 @@ export default function DukeMapClient() {
             ))}
           </div>
 
-          <div className="category-tabs" aria-label="地点分类">
+          <div
+            className="category-tabs draggable-tabs"
+            aria-label="????"
+            {...categoryDrag}
+          >
             <button
               type="button"
               className={activeCategory === "all" ? "active" : ""}
               onClick={() => setActiveCategory("all")}
             >
-              全部
+              ??
             </button>
             {availableCategories.map((category) => (
               <button
@@ -541,10 +983,10 @@ export default function DukeMapClient() {
             <div className="section-heading">
               <span>
                 {activeArea === "all"
-                  ? "全部地点"
+                  ? "????"
                   : AREA_META[activeArea].label}
               </span>
-              <small>{filteredPlaces.length} 个</small>
+              <small>{filteredPlaces.length} ?</small>
             </div>
             <div className="place-list">
               {groupedPlaces.map((group) => (
@@ -574,7 +1016,7 @@ export default function DukeMapClient() {
                           <strong>{place.shortName}</strong>
                           <small>
                             {place.categoryLabel}
-                            {place.room ? ` · ${place.room}` : ""}
+                            {place.room ? ` ? ${place.room}` : ""}
                           </small>
                         </span>
                         <ArrowRight size={16} />
@@ -586,14 +1028,14 @@ export default function DukeMapClient() {
               {filteredPlaces.length === 0 && (
                 <div className="empty-search">
                   <MapPin size={20} />
-                  <strong>当前清单里没有这个地点</strong>
-                  <span>尝试更短的名称，或切换到“全部区域”。</span>
+                  <strong>???????????</strong>
+                  <span>???????????????????</span>
                   <a
                     href="https://maps.duke.edu/"
                     target="_blank"
                     rel="noreferrer"
                   >
-                    去 Duke 官方地图搜索
+                    ? Duke ??????
                     <ExternalLink size={14} />
                   </a>
                 </div>
@@ -601,7 +1043,11 @@ export default function DukeMapClient() {
             </div>
           </section>
 
-          <section className="detail-card" aria-live="polite">
+          <section
+            ref={detailCardRef}
+            className="detail-card"
+            aria-live="polite"
+          >
             <div className="detail-topline">
               <span
                 className="category-badge"
@@ -610,7 +1056,7 @@ export default function DukeMapClient() {
                   background: CATEGORY_META[selectedPlace.category].soft,
                 }}
               >
-                {AREA_META[placeArea(selectedPlace)].shortLabel} ·{" "}
+                {AREA_META[placeArea(selectedPlace)].shortLabel} ?{" "}
                 {selectedPlace.categoryLabel}
               </span>
               <span
@@ -635,13 +1081,22 @@ export default function DukeMapClient() {
             </ul>
 
             <div className="origin-control">
-              <span>路线起点</span>
-              <div role="group" aria-label="路线起点">
+              <span>????</span>
+              <div role="group" aria-label="????">
                 <button
                   type="button"
                   className={originMode === "edens" ? "active" : ""}
                   onClick={() => {
                     setOriginMode("edens");
+                    const modes = travelModesFor(
+                      selectedPlace,
+                      EDENS.coordinates,
+                    );
+                    if (!modes.includes(travelMode)) {
+                      setTravelMode(
+                        modes.includes("walk") ? "walk" : modes[0],
+                      );
+                    }
                     clearRoute();
                   }}
                 >
@@ -653,7 +1108,7 @@ export default function DukeMapClient() {
                   onClick={useCurrentLocation}
                 >
                   <LocateFixed size={14} />
-                  当前位置
+                  ????
                 </button>
               </div>
             </div>
@@ -663,8 +1118,8 @@ export default function DukeMapClient() {
             )}
 
             <div className="travel-mode-control">
-              <span>交通方式</span>
-              <div role="group" aria-label="交通方式">
+              <span>????</span>
+              <div role="group" aria-label="????">
                 {availableTravelModes.map((mode) => (
                   <button
                     type="button"
@@ -696,24 +1151,60 @@ export default function DukeMapClient() {
               {travelMode === "drive" && <CarFront size={19} />}
               {travelMode === "shuttle" && <Bus size={19} />}
               {routeLoading
-                ? "正在计算路线…"
+                ? "???????"
                 : travelMode === "shuttle"
-                  ? "查看 Duke Shuttle 方案"
-                  : `规划${TRAVEL_MODE_META[travelMode].label}路线`}
+                  ? "?? Duke Shuttle ??"
+                  : `??${TRAVEL_MODE_META[travelMode].label}??`}
             </button>
 
-            {travelMode === "shuttle" && selectedPlace.shuttle && (
+            {travelMode === "shuttle" &&
+              !shuttlePlan &&
+              shuttlePreview && (
+                <div className="shuttle-result shuttle-preview">
+                  <Bus size={19} />
+                  <div>
+                    <strong>{shuttlePreview.routeName}</strong>
+                    <span>
+                      {shuttlePreview.board.shortName} ?{" "}
+                      {shuttlePreview.alight.shortName}
+                    </span>
+                    <small>???????????????????</small>
+                  </div>
+                </div>
+              )}
+
+            {shuttlePlan && (
               <div className="shuttle-result">
                 <Bus size={19} />
                 <div>
-                  <strong>{selectedPlace.shuttle.route}</strong>
-                  <span>{selectedPlace.shuttle.summary}</span>
+                  <strong>{shuttlePlan.routeName}</strong>
+                  <span>
+                    ? {shuttlePlan.board.shortName} ????{" "}
+                    {shuttlePlan.alight.shortName} ??
+                  </span>
+                  <div className="shuttle-walk-summary">
+                    <span>
+                      ???? {(shuttlePlan.originWalkKm * 1000).toFixed(0)} m
+                    </span>
+                    <span>
+                      ?????{" "}
+                      {(shuttlePlan.destinationWalkKm * 1000).toFixed(0)} m
+                    </span>
+                  </div>
+                  <ol className="shuttle-stop-list">
+                    {shuttlePlan.stops.map((stop, index) => (
+                      <li key={stop.id}>
+                        <b>{index + 1}</b>
+                        <span>{stop.name}</span>
+                      </li>
+                    ))}
+                  </ol>
                   <a
-                    href={selectedPlace.shuttle.liveUrl}
+                    href="https://duke.transloc.com/"
                     target="_blank"
                     rel="noreferrer"
                   >
-                    TransLoc 实时车辆
+                    TransLoc ????
                     <ExternalLink size={13} />
                   </a>
                 </div>
@@ -732,14 +1223,14 @@ export default function DukeMapClient() {
                 <div className="route-summary">
                   <span>
                     <Clock3 size={17} />
-                    <strong>{route.durationMinutes}</strong> 分钟
+                    <strong>{route.durationMinutes}</strong> ??
                   </span>
                   <span>
                     <Navigation size={17} />
                     <strong>{route.distanceKm.toFixed(2)}</strong> km
                   </span>
                   <button type="button" onClick={clearRoute}>
-                    清除
+                    ??
                   </button>
                 </div>
                 <ol className="route-steps">
@@ -753,7 +1244,7 @@ export default function DukeMapClient() {
                     </li>
                   ))}
                 </ol>
-                <p>{route.engine} · 路线仍应以现场封路和标识为准</p>
+                <p>{route.engine} ? ??????????????</p>
               </div>
             )}
 
@@ -795,7 +1286,7 @@ export default function DukeMapClient() {
               onClick={() => setShowSources((show) => !show)}
             >
               <BadgeCheck size={15} />
-              数据来源与核验日期
+              ?????????
               {showSources ? (
                 <ChevronUp size={15} />
               ) : (
@@ -812,9 +1303,9 @@ export default function DukeMapClient() {
                   {selectedPlace.source.label}
                   <ExternalLink size={13} />
                 </a>
-                <span>核验：{selectedPlace.source.checkedAt}</span>
+                <span>???{selectedPlace.source.checkedAt}</span>
                 {selectedPlace.address && (
-                  <span>地址：{selectedPlace.address}</span>
+                  <span>???{selectedPlace.address}</span>
                 )}
               </div>
             )}
@@ -822,8 +1313,8 @@ export default function DukeMapClient() {
 
           <section className="schedule-card">
             <div className="section-heading">
-              <span>Fall 2026 课程动线</span>
-              <small>以 DukeHub 为准</small>
+              <span>Fall 2026 ????</span>
+              <small>? DukeHub ??</small>
             </div>
             {FALL_2026_PLAN.map((day) => (
               <div className="schedule-day" key={day.day}>
@@ -854,7 +1345,7 @@ export default function DukeMapClient() {
           <section className="official-links-card">
             <div className="official-title">
               <Sparkles size={17} />
-              实时信息交给官方
+              ????????
             </div>
             <div>
               {OFFICIAL_LINKS.map((link) => (
@@ -874,19 +1365,19 @@ export default function DukeMapClient() {
           <footer className="panel-footer">
             <span>
               <Map size={14} />
-              地图 © OpenStreetMap
+              ?? ? OpenStreetMap
             </span>
             <span>
               <Bus size={14} />
-              校车 © Duke / TransLoc
+              ?? ? Duke / TransLoc
             </span>
             <span>
               <Printer size={14} />
-              设施 © Duke ePrint
+              ?? ? Duke ePrint
             </span>
             <span>
               <BookOpen size={14} />
-              课程需 DukeHub 确认
+              ??? DukeHub ??
             </span>
           </footer>
         </div>
